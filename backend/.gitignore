@@ -1,0 +1,11 @@
+# Environment files
+.env
+*.env
+!.env.example
+
+# Sensitive files
+*.key
+*.pem
+
+# Misc
+.DS_Store
