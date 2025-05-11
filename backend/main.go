@@ -131,9 +131,10 @@ func main() {
 	adminRouter := apiRouter.PathPrefix("/admin").Subrouter()
 	adminRouter.HandleFunc("/upload-video", adminHandler.UploadVideoHandler()).Methods("POST")
 	adminRouter.HandleFunc("/videos", adminHandler.GetChannelVideosHandler()).Methods("GET")
-	// New channel-specific video management routes
 	adminRouter.HandleFunc("/delete-video", adminHandler.DeleteVideoHandler()).Methods("POST")
 	adminRouter.HandleFunc("/update-video-order", adminHandler.UpdateVideoOrderHandler()).Methods("POST")
+	adminRouter.HandleFunc("/channel", adminHandler.GetChannelDetailsHandler()).Methods("GET")
+	adminRouter.HandleFunc("/channel/{channelID}", adminHandler.UpdateChannelDetailsHandler()).Methods("PUT")
 	
 	// Thumbnail route - serves S3 thumbnails
 	apiRouter.PathPrefix("/thumbnails/").HandlerFunc(adminHandler.ThumbnailHandler())

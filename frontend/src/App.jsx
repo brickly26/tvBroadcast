@@ -7,6 +7,7 @@ import UnmuteButton from "./components/UnmuteButton";
 import ConnectionStatus from "./components/ConnectionStatus";
 import LoginForm from "./components/LoginForm";
 import useWebSocket from "./hooks/useWebSocket";
+import { Toaster } from "react-hot-toast";
 
 const App = () => {
   // State for managing the application
@@ -79,34 +80,34 @@ const App = () => {
   const handleLogin = async (username, password) => {
     setIsLoading(true);
     setAuthError("");
-    
+
     try {
-      const response = await fetch('/api/auth/login', {
-        method: 'POST',
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
         headers: {
-          'Content-Type': 'application/json',
+          "Content-Type": "application/json",
         },
-        credentials: 'include',
+        credentials: "include",
         body: JSON.stringify({ username, password }),
       });
-      
+
       const data = await response.json();
-      
+
       if (response.ok && data.success) {
         setIsAdmin(true);
         setShowLoginForm(false);
         setShowAdmin(true);
       } else {
-        setAuthError(data.message || 'Invalid credentials');
+        setAuthError(data.message || "Invalid credentials");
       }
     } catch (error) {
-      console.error('Login error:', error);
-      setAuthError('Server error. Please try again.');
+      console.error("Login error:", error);
+      setAuthError("Server error. Please try again.");
     } finally {
       setIsLoading(false);
     }
   };
-  
+
   // Close login form
   const closeLoginForm = () => {
     setShowLoginForm(false);
@@ -118,10 +119,10 @@ const App = () => {
     const checkAdminStatus = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch('/api/auth/verify-admin', {
-          credentials: 'include'
+        const response = await fetch("/api/auth/verify-admin", {
+          credentials: "include",
         });
-        
+
         if (response.ok) {
           const data = await response.json();
           if (data.success && data.isAdmin) {
@@ -129,12 +130,12 @@ const App = () => {
           }
         }
       } catch (error) {
-        console.error('Error checking admin status:', error);
+        console.error("Error checking admin status:", error);
       } finally {
         setIsLoading(false);
       }
     };
-    
+
     checkAdminStatus();
   }, []);
 
@@ -145,7 +146,7 @@ const App = () => {
       if (e.key === "d" || e.key === "D") {
         setShowDebug((prev) => !prev);
       }
-      
+
       // Admin shortcut (Ctrl+Shift+A)
       if (e.ctrlKey && e.shiftKey && (e.key === "a" || e.key === "A")) {
         if (isAdmin) {
@@ -162,6 +163,31 @@ const App = () => {
 
   return (
     <div className="fixed inset-0 h-screen w-screen bg-black overflow-hidden">
+      {/* Toast Notifications */}
+      <Toaster
+        position="top-right"
+        toastOptions={{
+          style: {
+            background: "#333",
+            color: "#fff",
+          },
+          success: {
+            duration: 3000,
+            iconTheme: {
+              primary: "#10B981",
+              secondary: "#fff",
+            },
+          },
+          error: {
+            duration: 4000,
+            iconTheme: {
+              primary: "#EF4444",
+              secondary: "#fff",
+            },
+          },
+        }}
+      />
+
       {/* Video Player */}
       <VideoPlayer
         videoUrl={currentVideoInfo.url}
@@ -196,7 +222,7 @@ const App = () => {
           closeGuide={() => setShowGuide(false)}
         />
       )}
-      
+
       {/* Admin Dashboard (Modal) */}
       {showAdmin && isAdmin && (
         <AdminDashboard
@@ -204,7 +230,7 @@ const App = () => {
           isOpen={showAdmin}
         />
       )}
-      
+
       {/* Login Form (Modal) */}
       {showLoginForm && (
         <LoginForm

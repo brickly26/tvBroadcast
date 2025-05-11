@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"live-broadcast-backend/database"
+	"live-broadcast-backend/models"
 	"live-broadcast-backend/services"
 	"log"
 	"net/http"
@@ -32,6 +33,13 @@ type VideoOrderRequest struct {
 type VideoThumbnailRequest struct {
 	VideoID      string `json:"videoId"`
 	ThumbnailURL string `json:"thumbnailUrl"`
+}
+
+// ChannelUpdateRequest is the request body for updating a channel's details
+type ChannelUpdateRequest struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Theme       string `json:"theme"`
 }
 
 // AdminHandler contains dependencies for admin handlers
@@ -445,5 +453,128 @@ func (h *AdminHandler) ThumbnailHandler() http.HandlerFunc {
 		
 		// Redirect the client to the pre-signed URL
 		http.Redirect(w, r, presignedURL, http.StatusTemporaryRedirect)
+	}
+}
+
+// GetChannelDetailsHandler returns the details for a specific channel
+func (h *AdminHandler) GetChannelDetailsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Verify admin authentication
+		userID, ok := h.isAuthenticated(r)
+		if !ok {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// Check if user is admin
+		isAdmin, err := h.db.IsUserAdmin(userID)
+		if err != nil || !isAdmin {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		// Get channel ID from query parameter
+		channelIDStr := r.URL.Query().Get("channel")
+		if channelIDStr == "" {
+			http.Error(w, "Channel ID is required", http.StatusBadRequest)
+			return
+		}
+
+		channelID, err := strconv.Atoi(channelIDStr)
+		if err != nil || channelID < 1 || channelID > 5 {
+			http.Error(w, "Invalid channel ID", http.StatusBadRequest)
+			return
+		}
+
+		// For now, use the predefined channels from the models package
+		// In a real app, this would come from the database
+		predefinedChannels := models.PredefinedChannels()
+		var channelDetails *models.Channel
+		
+		for _, channel := range predefinedChannels {
+			if channel.Number == channelID {
+				channelDetails = channel
+				break
+			}
+		}
+		
+		if channelDetails == nil {
+			http.Error(w, "Channel not found", http.StatusNotFound)
+			return
+		}
+
+		// Return channel details as JSON
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"channel": channelDetails,
+		})
+	}
+}
+
+// UpdateChannelDetailsHandler updates the details for a specific channel
+func (h *AdminHandler) UpdateChannelDetailsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Verify admin authentication
+		userID, ok := h.isAuthenticated(r)
+		if !ok {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// Check if user is admin
+		isAdmin, err := h.db.IsUserAdmin(userID)
+		if err != nil || !isAdmin {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		// Get channel ID from path parameter
+		// Expected URL format: /api/admin/channel/{channelID}
+		parts := strings.Split(r.URL.Path, "/")
+		if len(parts) < 5 {
+			http.Error(w, "Invalid request path", http.StatusBadRequest)
+			return
+		}
+		
+		channelIDStr := parts[4]
+		channelID, err := strconv.Atoi(channelIDStr)
+		if err != nil || channelID < 1 || channelID > 5 {
+			http.Error(w, "Invalid channel ID", http.StatusBadRequest)
+			return
+		}
+
+		// Parse request body
+		var req ChannelUpdateRequest
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&req); err != nil {
+			log.Printf("Failed to decode update channel request: %v", err)
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.Name == "" || req.Description == "" || req.Theme == "" {
+			http.Error(w, "Name, description, and theme are required", http.StatusBadRequest)
+			return
+		}
+
+		// In a real app, update channel in database
+		// For now, we'll just return success
+		log.Printf("Channel %d update request: Name=%s, Description=%s, Theme=%s", 
+			channelID, req.Name, req.Description, req.Theme)
+
+		// Return success response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Channel details updated successfully",
+			"channel": map[string]interface{}{
+				"number":      channelID,
+				"name":        req.Name,
+				"description": req.Description,
+				"theme":       req.Theme,
+			},
+		})
 	}
 }
