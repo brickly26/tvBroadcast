@@ -1,22 +1,24 @@
 import React, { useEffect, useRef, useState } from "react";
 
+const API_HOST = "http://localhost:8080"; // back‑end base URL
+
 /**
- * Live, un‑seekable player that consumes /live/{channelNumber}
+ * Live, un‑seekable player for GET /live/{channelNumber}
  *
  * Props
- * ─────────────────────────────
- * channelNumber   integer   – the channel to watch
- * muted           boolean   – keep sound off?
- * volume          0‥1       – volume level
+ * ────────────────────────────────────────────────────────────────
+ * channelNumber   int        – which live channel to watch
+ * muted           boolean    – start muted (needed for autoplay)
+ * volume          0‥1        – initial volume
  */
-const VideoPlayer = ({ channelNumber, muted, volume }) => {
+const VideoPlayer = ({ channelNumber, muted = true, volume = 1.0 }) => {
   const videoRef = useRef(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  /* ─── attach MediaSource and start pumping ─────────────────────────────── */
+  /* ─── create / switch stream ──────────────────────────────────────── */
   useEffect(() => {
-    if (!channelNumber && channelNumber !== 0) return; // wait for prop
+    if (channelNumber === undefined || channelNumber === null) return;
 
     const video = videoRef.current;
     if (!video) return;
@@ -25,100 +27,126 @@ const VideoPlayer = ({ channelNumber, muted, volume }) => {
     setError(null);
 
     const mediaSource = new MediaSource();
-    video.src = URL.createObjectURL(mediaSource);
+    let reader; // fetch reader for tidy cleanup
+    let firstChunk = true; // hide spinner after first append
 
-    let reader; // will hold the fetch reader so we can abort on unmount
-
+    /* fires once when MSE is ready                                      */
     const handleSourceOpen = () => {
-      const mime = 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"'; // H.264 + AAC baseline
-      if (!MediaSource.isTypeSupported(mime)) {
+      /* pick a codec string the current browser actually supports ------ */
+      const candidates = [
+        'video/mp4; codecs="avc1.640028,mp4a.40.2"', // H.264 High L4.0 + AAC
+        'video/mp4; codecs="avc1.4d401f,mp4a.40.2"', // Main L3.1
+        'video/mp4; codecs="avc1.42E01E,mp4a.40.2"', // Baseline L3.0
+        "video/mp4", // wildcard fallback
+      ];
+      const mime = candidates.find((c) => MediaSource.isTypeSupported(c));
+      if (!mime) {
         setError("Browser lacks MP4 (H.264/AAC) support");
         return;
       }
 
-      const sourceBuffer = mediaSource.addSourceBuffer(mime);
+      const buf = mediaSource.addSourceBuffer(mime);
+      buf.addEventListener("error", (e) => {
+        console.error("SourceBuffer fatal error", e);
+        setError("Browser rejected the stream");
+      });
 
-      /* fetch live stream in chunks */
-      fetch(`/live/${channelNumber}`)
+      /* recursive read‑&‑append loop with updateend gating ------------- */
+      const pump = () =>
+        reader.read().then(({ value, done }) => {
+          if (done) {
+            const finish = () => mediaSource.endOfStream();
+            return buf.updating
+              ? buf.addEventListener("updateend", finish, { once: true })
+              : finish();
+          }
+
+          const push = () => {
+            if (!buf.updating) {
+              try {
+                buf.appendBuffer(value);
+                if (firstChunk) {
+                  setIsLoading(false);
+                  firstChunk = false;
+                }
+                pump(); // next chunk
+              } catch (e) {
+                console.error("appendBuffer failed:", e);
+                setError("Decode error");
+              }
+            } else {
+              buf.addEventListener("updateend", push, { once: true });
+            }
+          };
+          push();
+        });
+
+      /* start the network fetch --------------------------------------- */
+      fetch(`${API_HOST}/live/${channelNumber}`)
         .then((res) => {
           reader = res.body.getReader();
-          const pump = () =>
-            reader.read().then(({ value, done }) => {
-              if (done) {
-                mediaSource.endOfStream();
-                return;
-              }
-              sourceBuffer.appendBuffer(value);
-              setIsLoading(false); // first chunk arrived → hide spinner
-              pump();
-            });
           pump();
         })
         .catch((e) => {
           console.error("Stream fetch failed:", e);
-          setError("Unable to connect to stream");
+          setError("Stream error");
         });
     };
 
+    /* attach BEFORE setting src to avoid missing the event              */
     mediaSource.addEventListener("sourceopen", handleSourceOpen);
+    video.src = URL.createObjectURL(mediaSource);
 
-    /* cleanup on unmount or channel switch */
+    /* respect autoplay policies                                         */
+    video.muted = muted;
+    video.volume = volume;
+    video.play().catch(() => {
+      /* user will need to click play; spinner stays until then */
+    });
+
+    /* cleanup on unmount / channel change ----------------------------- */
     return () => {
       mediaSource.removeEventListener("sourceopen", handleSourceOpen);
       if (reader) reader.cancel();
-      video.removeAttribute("src"); // drop object URL
+      video.pause();
+      video.removeAttribute("src");
       video.load();
     };
   }, [channelNumber]);
 
-  /* ─── apply mute / volume every time they change ──────────────────────── */
+  /* apply mute / volume updates on the fly ---------------------------- */
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.volume = volume;
-    video.muted = muted;
-  }, [volume, muted]);
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = muted;
+    v.volume = volume;
+  }, [muted, volume]);
 
-  /* ─── keep the video playing (no seek bar, no pausing) ─────────────────── */
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    const resume = () => {
-      if (!video.paused) return;
-      video.play().catch(() => {}); // ignore “not allowed” – user may click
-    };
-
-    video.addEventListener("pause", resume);
-    resume(); // attempt once on mount
-
-    return () => video.removeEventListener("pause", resume);
-  }, [isLoading]);
-
+  /* ─── UI markup (unchanged styling) ───────────────────────────────── */
   return (
-    <div className="video-player-container absolute inset-0 z-0">
+    <div className="video-player-container relative w-full h-full">
       {isLoading && (
-        <div className="video-loading absolute inset-0 flex items-center justify-center bg-black bg-opacity-70 text-white text-2xl z-10">
-          Loading channel {channelNumber}…
+        <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-white z-10">
+          Loading channel&nbsp;{channelNumber}…
         </div>
       )}
 
       {error && (
-        <div className="video-error absolute inset-0 flex items-center justify-center bg-black bg-opacity-70 text-red-500 text-2xl z-10">
+        <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-red-500 z-10">
           {error}
         </div>
       )}
 
       <video
         ref={videoRef}
-        className="video-player w-full h-full object-cover bg-black"
+        className="w-full h-full object-cover bg-black"
         autoPlay
         playsInline
         controlsList="nodownload noremoteplayback nofullscreen noplaybackrate"
       />
 
-      <div className="video-info absolute bottom-4 left-4 text-white bg-black bg-opacity-50 px-4 py-2 rounded">
-        Live · Channel {channelNumber}
+      <div className="absolute bottom-4 left-4 text-white bg-black/60 px-3 py-1 rounded">
+        Live&nbsp;·&nbsp;Channel&nbsp;{channelNumber}
       </div>
     </div>
   );

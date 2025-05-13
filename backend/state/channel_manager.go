@@ -64,11 +64,24 @@ func (cm *ChannelManager) SetDBProvider(p DBProvider)      { cm.mu.Lock(); cm.db
 
 /* ---------- helper: ensure a local copy and return its path ---------- */
 func (cm *ChannelManager) getLocalPath(s3Key string) (string, error) {
+	// make sure we have the file locally first
+	var local string
 	if cm.videoProvider.IsVideoDownloaded(s3Key) {
-		// s3Key doubles as relative path inside ./videos
-		return filepath.Join("./videos", s3Key), nil
+		local = filepath.Join("./videos", s3Key)
+	} else {
+		var err error
+		local, err = cm.videoProvider.DownloadVideo(s3Key)
+		if err != nil {
+			return "", err
+		}
 	}
-	return cm.videoProvider.DownloadVideo(s3Key) // returns local path
+
+	// guarantee MSE‑friendly fragmentation (moof+mdat pairs)
+	fragPath, err := services.EnsureFragmented(local)
+	if err != nil {
+		return "", err
+	}
+	return fragPath, nil
 }
 
 /* ---------- INITIALIZATION from S3 or DB (unchanged except broadcaster bootstrap) ---------- */
@@ -102,9 +115,14 @@ func (cm *ChannelManager) InitializeWithS3Content(channels []*models.Channel, vi
 		if len(videoList) > 0 {
 			first = videoList[0]
 		} else {
-			for _, v := range videos { first = v; break } // any video
+			for _, v := range videos {
+				first = v
+				break
+			}
 		}
-		if first == nil { continue }
+		if first == nil {
+			continue
+		}
 
 		cm.channelStates[ch.Number] = &models.ChannelState{
 			Channel:        ch,
@@ -112,12 +130,14 @@ func (cm *ChannelManager) InitializeWithS3Content(channels []*models.Channel, vi
 			VideoStartTime: time.Now(),
 		}
 
-		// kick‑start broadcaster
+		// ensure file exists and is fragmented
 		loc, err := cm.getLocalPath(first.S3Key)
 		if err != nil {
 			log.Printf("channel %d: cannot fetch first video: %v", ch.Number, err)
 			continue
 		}
+
+		// kick‑start broadcaster
 		bc, err := services.NewBroadcaster(ch.Number, loc, 64*1024, 2_000_000/8)
 		if err != nil {
 			log.Printf("channel %d: broadcaster err: %v", ch.Number, err)
@@ -125,11 +145,76 @@ func (cm *ChannelManager) InitializeWithS3Content(channels []*models.Channel, vi
 			cm.broadcasters[ch.Number] = bc
 		}
 
-		// preload next if available
 		if len(videoList) > 1 {
 			cm.nextVideoByChannel[ch.Number] = videoList[1]
 		}
 	}
+}
+
+func (cm *ChannelManager) InitializeFromDatabase() error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.dbProvider == nil {
+		return fmt.Errorf("db provider not set")
+	}
+
+	channels, err := cm.dbProvider.GetAllChannels()
+	if err != nil {
+		return err
+	}
+
+	for _, ch := range channels {
+		videos, err := cm.dbProvider.GetChannelVideos(ch.Number)
+		if err != nil {
+			return err
+		}
+		if len(videos) == 0 {
+			log.Printf("Warning: no videos in DB for channel %d", ch.Number)
+			continue
+		}
+
+		/* --- persist video metadata & S3 keys ----------------------------- */
+		for _, v := range videos {
+			cm.videos[v.ID] = v
+			cm.validS3Keys = append(cm.validS3Keys, v.S3Key)
+			cm.channelVideoMap[ch.Number] = append(cm.channelVideoMap[ch.Number], v)
+		}
+
+		/* --- initialise channel state ------------------------------------ */
+		first := videos[0]
+		cm.channelStates[ch.Number] = &models.ChannelState{
+			Channel:        ch,
+			CurrentVideo:   first,
+			VideoStartTime: time.Now(),
+		}
+		if len(videos) > 1 {
+			cm.nextVideoByChannel[ch.Number] = videos[1]
+		}
+
+		/* --- make sure the first file exists locally --------------------- */
+		localPath := ""
+		if cm.videoProvider != nil {
+			localPath, err = cm.getLocalPath(first.S3Key)
+			if err != nil {
+				log.Printf("channel %d: cannot fetch initial video: %v", ch.Number, err)
+				continue
+			}
+		}
+
+		/* --- create (or reuse) broadcaster -------------------------------- */
+		if _, ok := cm.broadcasters[ch.Number]; !ok && localPath != "" {
+			bc, err := services.NewBroadcaster(ch.Number, localPath, 64*1024, 2_000_000/8)
+			if err != nil {
+				log.Printf("channel %d: broadcaster error: %v", ch.Number, err)
+			} else {
+				cm.broadcasters[ch.Number] = bc
+			}
+		}
+	}
+
+	cm.initialized = true
+	return nil
 }
 
 /* InitializeFromDatabase identical to your current version – omit here for brevity */
@@ -142,38 +227,52 @@ func (cm *ChannelManager) videoScheduler() {
 
 	for range ticker.C {
 		cm.mu.Lock()
-		if cm.videoProvider == nil { cm.mu.Unlock(); continue }
-
+		if cm.videoProvider == nil {
+			cm.mu.Unlock()
+			continue
+		}
 		now := time.Now()
 
 		for chNum, st := range cm.channelStates {
-			if st.CurrentVideo == nil { continue }
+			bc := cm.broadcasters[chNum]
 
-			elapsed := now.Sub(st.VideoStartTime).Seconds()
-			if elapsed < st.CurrentVideo.Duration { continue } // not finished yet
+			/* 1) broadcaster flagged fatal – advance immediately */
+			if bc != nil && bc.CurrentPath() == "" {
+				next := cm.pickNextVideo(chNum, st.CurrentVideo)
+				if next != nil {
+					if local, err := cm.getLocalPath(next.S3Key); err == nil {
+						_ = bc.SwitchSource(local)
+						st.CurrentVideo = next
+						st.VideoStartTime = now
+					} else {
+						log.Printf("channel %d: cannot switch after fatal: %v", chNum, err)
+					}
+				}
+				continue
+			}
 
-			oldKey := st.CurrentVideo.S3Key
+			/* 2) normal end‑of‑video rotation */
+			if st.CurrentVideo == nil {
+				continue
+			}
+			if elapsed := now.Sub(st.VideoStartTime).Seconds(); elapsed < st.CurrentVideo.Duration {
+				continue
+			}
+
 			next := cm.pickNextVideo(chNum, st.CurrentVideo)
-			if next == nil { continue }
-
-			// ensure local
-			localPath, err := cm.getLocalPath(next.S3Key)
+			if next == nil {
+				continue
+			}
+			local, err := cm.getLocalPath(next.S3Key)
 			if err != nil {
 				log.Printf("channel %d: cannot fetch next video: %v", chNum, err)
 				continue
 			}
-
-			// update state
+			if bc != nil {
+				_ = bc.SwitchSource(local)
+			}
 			st.CurrentVideo = next
 			st.VideoStartTime = now
-
-			// broadcast switch
-			if bc := cm.broadcasters[chNum]; bc != nil {
-				_ = bc.SwitchSource(localPath)
-			}
-
-			// background delete previous file
-			go cm.videoProvider.DeleteVideo(oldKey)
 		}
 		cm.mu.Unlock()
 	}
