@@ -21,9 +21,9 @@ const useWebSocket = (path = "ws") => {
     // This prevents flickering when channel state has temporary issues
     setChannelData((prevData) => {
       const prevChannelData = prevData[channel] || {};
-      const prevVideoId = prevChannelData.videoId || '';
+      const prevVideoId = prevChannelData.videoId || "";
       const now = Date.now();
-      
+
       // Only update if we have a URL or if this is a new video
       if (!url && prevChannelData.url && prevVideoId === videoId) {
         // Just update the time but keep the existing URL
@@ -109,7 +109,8 @@ const useWebSocket = (path = "ws") => {
   const getReconnectDelay = useCallback(() => {
     const attempts = reconnectAttemptsRef.current;
     // Base delay of 1 second with exponential backoff (2^attempts)
-    const delay = Math.min(1000 * Math.pow(2, attempts), maxReconnectDelay);
+    // const delay = Math.min(1000 * Math.pow(2, attempts), maxReconnectDelay);
+    const delay = 5000;
     console.log(`Reconnect attempt ${attempts + 1}, delay: ${delay}ms`);
     return delay;
   }, []);
@@ -131,12 +132,13 @@ const useWebSocket = (path = "ws") => {
 
       // Connect to the backend WebSocket server
       // Make sure this points to your Go backend server, not the frontend dev server
-      const apiBaseUrl = process.env.NODE_ENV === 'production' 
-        ? window.location.origin
-        : 'http://localhost:8080';
+      const apiBaseUrl =
+        process.env.NODE_ENV === "production"
+          ? window.location.origin
+          : "http://localhost:8080";
 
-      const wsProtocol = apiBaseUrl.startsWith('https') ? 'wss:' : 'ws:';
-      const wsHost = apiBaseUrl.replace(/^https?:\/\//, '');
+      const wsProtocol = apiBaseUrl.startsWith("https") ? "wss:" : "ws:";
+      const wsHost = apiBaseUrl.replace(/^https?:\/\//, "");
       const wsUrl = `${wsProtocol}//${wsHost}/ws`;
 
       console.log("Creating WebSocket connection to:", wsUrl);

@@ -190,11 +190,9 @@ const App = () => {
 
       {/* Video Player */}
       <VideoPlayer
-        videoUrl={currentVideoInfo.url}
-        currentTime={currentVideoInfo.currentTime}
         muted={muted}
         volume={volume / 100} // Convert to 0-1 range for HTML5 video
-        currentChannel={currentChannel}
+        channelNumber={currentChannel}
       />
 
       {/* Floating Menu (Bottom Right) */}

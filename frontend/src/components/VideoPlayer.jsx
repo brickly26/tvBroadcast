@@ -1,152 +1,152 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from "react";
 
-const VideoPlayer = ({ videoUrl, currentTime, muted, volume, currentChannel }) => {
+const API_HOST = "http://localhost:8080"; // back‑end base URL
+
+/**
+ * Live, un‑seekable player for GET /live/{channelNumber}
+ *
+ * Props
+ * ────────────────────────────────────────────────────────────────
+ * channelNumber   int        – which live channel to watch
+ * muted           boolean    – start muted (needed for autoplay)
+ * volume          0‥1        – initial volume
+ */
+const VideoPlayer = ({ channelNumber, muted = true, volume = 1.0 }) => {
   const videoRef = useRef(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
-  const lastSyncTime = useRef(0);
-  const syncIntervalRef = useRef(null);
 
-  // Handle video loading
+  /* ─── create / switch stream ──────────────────────────────────────── */
   useEffect(() => {
-    if (videoRef.current && videoUrl) {
-      setIsLoading(true);
-      setError(null);
-      
-      const video = videoRef.current;
-      
-      // If URL changed, update the video source
-      if (video.src !== videoUrl && videoUrl) {
-        console.log(`Loading new video: ${videoUrl}`);
-        video.src = videoUrl;
-        
-        // Set up event listeners for this new source
-        const handleCanPlay = () => {
-          setIsLoading(false);
-          // When video can play, synchronize to server time
-          synchronizeWithServer();
-        };
+    if (channelNumber === undefined || channelNumber === null) return;
 
-        const handleError = (e) => {
-          console.error('Video error:', e);
-          setIsLoading(false);
-          setError('Failed to load video. Please try again later.');
-        };
-
-        video.addEventListener('canplay', handleCanPlay);
-        video.addEventListener('error', handleError);
-
-        return () => {
-          video.removeEventListener('canplay', handleCanPlay);
-          video.removeEventListener('error', handleError);
-        };
-      }
-    }
-  }, [videoUrl]);
-
-  // Synchronize with server time
-  const synchronizeWithServer = () => {
-    if (!videoRef.current || !currentTime) return;
-    
-    const video = videoRef.current;
-    const now = Date.now();
-    
-    // Only sync if we haven't synced in the last 5 seconds or if we're too far off
-    const timeSinceLastSync = now - lastSyncTime.current;
-    const timeDifference = Math.abs(video.currentTime - currentTime);
-    
-    if (timeSinceLastSync > 5000 || timeDifference > 3) {
-      console.log(`Syncing video time: server=${currentTime}, current=${video.currentTime}`);
-      try {
-        video.currentTime = currentTime;
-        lastSyncTime.current = now;
-      } catch (e) {
-        console.error('Error setting video time:', e);
-      }
-    }
-  };
-
-  // Set up regular synchronization with server
-  useEffect(() => {
-    // Sync immediately when current time changes significantly
-    if (currentTime) {
-      synchronizeWithServer();
-    }
-    
-    // Set up periodic sync for minor corrections
-    if (!syncIntervalRef.current) {
-      syncIntervalRef.current = setInterval(() => {
-        synchronizeWithServer();
-      }, 10000); // Check sync every 10 seconds
-    }
-    
-    return () => {
-      if (syncIntervalRef.current) {
-        clearInterval(syncIntervalRef.current);
-        syncIntervalRef.current = null;
-      }
-    };
-  }, [currentTime]);
-
-  // Apply volume and mute settings
-  useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    
-    video.volume = volume;
+
+    setIsLoading(true);
+    setError(null);
+
+    const mediaSource = new MediaSource();
+    let reader; // fetch reader for tidy cleanup
+    let firstChunk = true; // hide spinner after first append
+
+    /* fires once when MSE is ready                                      */
+    const handleSourceOpen = () => {
+      /* pick a codec string the current browser actually supports ------ */
+      const candidates = [
+        'video/mp4; codecs="avc1.640028,mp4a.40.2"', // H.264 High L4.0 + AAC
+        'video/mp4; codecs="avc1.4d401f,mp4a.40.2"', // Main L3.1
+        'video/mp4; codecs="avc1.42E01E,mp4a.40.2"', // Baseline L3.0
+        "video/mp4", // wildcard fallback
+      ];
+      const mime = candidates.find((c) => MediaSource.isTypeSupported(c));
+      if (!mime) {
+        setError("Browser lacks MP4 (H.264/AAC) support");
+        return;
+      }
+
+      const buf = mediaSource.addSourceBuffer(mime);
+      buf.addEventListener("error", (e) => {
+        console.error("SourceBuffer fatal error", e);
+        setError("Browser rejected the stream");
+      });
+
+      /* recursive read‑&‑append loop with updateend gating ------------- */
+      const pump = () =>
+        reader.read().then(({ value, done }) => {
+          if (done) {
+            const finish = () => mediaSource.endOfStream();
+            return buf.updating
+              ? buf.addEventListener("updateend", finish, { once: true })
+              : finish();
+          }
+
+          const push = () => {
+            if (!buf.updating) {
+              try {
+                buf.appendBuffer(value);
+                if (firstChunk) {
+                  setIsLoading(false);
+                  firstChunk = false;
+                }
+                pump(); // next chunk
+              } catch (e) {
+                console.error("appendBuffer failed:", e);
+                setError("Decode error");
+              }
+            } else {
+              buf.addEventListener("updateend", push, { once: true });
+            }
+          };
+          push();
+        });
+
+      /* start the network fetch --------------------------------------- */
+      fetch(`${API_HOST}/live/${channelNumber}`)
+        .then((res) => {
+          reader = res.body.getReader();
+          pump();
+        })
+        .catch((e) => {
+          console.error("Stream fetch failed:", e);
+          setError("Stream error");
+        });
+    };
+
+    /* attach BEFORE setting src to avoid missing the event              */
+    mediaSource.addEventListener("sourceopen", handleSourceOpen);
+    video.src = URL.createObjectURL(mediaSource);
+
+    /* respect autoplay policies                                         */
     video.muted = muted;
-  }, [volume, muted]);
+    video.volume = volume;
+    video.play().catch(() => {
+      /* user will need to click play; spinner stays until then */
+    });
 
-  // Start playing automatically when ready and keep playing
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    
-    const handlePause = () => {
-      // If video somehow pauses, restart it (unless at the end)
-      if (video.currentTime < video.duration - 0.5) {
-        video.play().catch(e => console.error('Failed to auto-resume video:', e));
-      }
-    };
-    
-    video.addEventListener('pause', handlePause);
-    
-    // Attempt to play if we have a URL
-    if (videoUrl && video.paused) {
-      video.play().catch(e => console.error('Failed to auto-play video:', e));
-    }
-    
+    /* cleanup on unmount / channel change ----------------------------- */
     return () => {
-      video.removeEventListener('pause', handlePause);
+      mediaSource.removeEventListener("sourceopen", handleSourceOpen);
+      if (reader) reader.cancel();
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
     };
-  }, [videoUrl, isLoading]);
+  }, [channelNumber]);
 
+  /* apply mute / volume updates on the fly ---------------------------- */
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = muted;
+    v.volume = volume;
+  }, [muted, volume]);
+
+  /* ─── UI markup (unchanged styling) ───────────────────────────────── */
   return (
-    <div className="video-player-container absolute inset-0 z-0">
+    <div className="video-player-container relative w-full h-full">
       {isLoading && (
-        <div className="video-loading absolute inset-0 flex items-center justify-center bg-black bg-opacity-70 text-white text-2xl z-10">
-          Loading video...
+        <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-white z-10">
+          Loading channel&nbsp;{channelNumber}…
         </div>
       )}
-      
+
       {error && (
-        <div className="video-error absolute inset-0 flex items-center justify-center bg-black bg-opacity-70 text-red-500 text-2xl z-10">
+        <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-red-500 z-10">
           {error}
         </div>
       )}
-      
-      <video 
+
+      <video
         ref={videoRef}
-        className="video-player w-full h-full object-cover bg-black"
+        className="w-full h-full object-cover bg-black"
         autoPlay
         playsInline
-      >
-        {videoUrl && <source src={videoUrl} type="video/mp4" />}
-        Your browser does not support the video tag.
-      </video>
-      
-      <div className="video-info absolute bottom-4 left-4 text-white bg-black bg-opacity-50 px-4 py-2 rounded">
-        Channel {currentChannel} - {Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')}
+        controlsList="nodownload noremoteplayback nofullscreen noplaybackrate"
+      />
+
+      <div className="absolute bottom-4 left-4 text-white bg-black/60 px-3 py-1 rounded">
+        Live&nbsp;·&nbsp;Channel&nbsp;{channelNumber}
       </div>
     </div>
   );

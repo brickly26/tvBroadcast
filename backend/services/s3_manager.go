@@ -7,6 +7,7 @@ import (
 	"live-broadcast-backend/models"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -100,53 +101,18 @@ func (sm *S3Manager) ListVideosInFolder(folder string) ([]string, error) {
 }
 
 // DownloadVideo downloads a video from S3 to the local file system
-func (sm *S3Manager) DownloadVideo(s3Key string) (string, error) {
-	// Create directory structure if needed
-	localPath := filepath.Join(sm.videoDir, s3Key)
-	dir := filepath.Dir(localPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create directory %s: %v", dir, err)
-	}
-
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		// File exists, mark as downloaded and return path
-		sm.mutex.Lock()
-		sm.downloads[s3Key] = true
-		sm.mutex.Unlock()
-		return localPath, nil
-	}
-
-	// Get object from S3
-	resp, err := sm.s3Client.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: &sm.bucket,
-		Key:    &s3Key,
-	})
-
+func (m *S3Manager) DownloadVideo(s3Key string) (string, error) {
+	tmpPath, err := m.rawDownload(s3Key) // <- your existing internal downloader
 	if err != nil {
-		return "", fmt.Errorf("failed to get object %s from S3: %v", s3Key, err)
-	}
-	defer resp.Body.Close()
-
-	// Create local file
-	out, err := os.Create(localPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to create local file %s: %v", localPath, err)
-	}
-	defer out.Close()
-
-	// Copy data from S3 to local file
-	if _, err = io.Copy(out, resp.Body); err != nil {
-		return "", fmt.Errorf("failed to download file %s: %v", s3Key, err)
+		return "", err
 	}
 
-	// Mark as downloaded
-	sm.mutex.Lock()
-	sm.downloads[s3Key] = true
-	sm.mutex.Unlock()
-
-	log.Printf("Successfully downloaded %s to %s", s3Key, localPath)
-	return localPath, nil
+	/* validate first 3 s of media to catch corrupt transfers */
+	if err := validateMP4(tmpPath); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("downloaded mp4 is corrupt: %w", err)
+	}
+	return tmpPath, nil
 }
 
 // CreateVideoObject creates a Video object from an S3 video
@@ -301,4 +267,57 @@ func getThemeForChannel(channelNum int) string {
 		return themes[channelNum-1]
 	}
 	return "general"
+}
+
+func validateMP4(path string) error {
+	cmd := exec.Command("ffprobe", "-v", "error", "-read_intervals", "%+#3", "-i", path)
+	return cmd.Run()
+}
+
+func (sm *S3Manager) rawDownload(s3Key string) (string, error) {
+	// Check cache first
+	sm.mutex.Lock()
+	if sm.downloads[s3Key] {
+		sm.mutex.Unlock()
+		return filepath.Join(sm.videoDir, s3Key), nil
+	}
+	sm.mutex.Unlock()
+
+	// Get the object from S3
+	resp, err := sm.s3Client.GetObject(
+		context.Background(),
+		&s3.GetObjectInput{
+			Bucket: aws.String(sm.bucket),
+			Key:    aws.String(s3Key),
+		},
+	)
+	if err != nil {
+		return "", fmt.Errorf("s3 getObject %s: %w", s3Key, err)
+	}
+	defer resp.Body.Close()
+
+	// Make sure parent folders exist
+	localPath := filepath.Join(sm.videoDir, s3Key)
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return "", fmt.Errorf("mkdir %s: %w", filepath.Dir(localPath), err)
+	}
+
+	// Stream copy to disk
+	out, err := os.Create(localPath)
+	if err != nil {
+		return "", fmt.Errorf("create %s: %w", localPath, err)
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		out.Close()
+		os.Remove(localPath)
+		return "", fmt.Errorf("copy %s: %w", s3Key, err)
+	}
+	out.Close()
+
+	// mark as downloaded
+	sm.mutex.Lock()
+	sm.downloads[s3Key] = true
+	sm.mutex.Unlock()
+
+	return localPath, nil
 }
