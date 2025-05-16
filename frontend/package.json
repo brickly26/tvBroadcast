@@ -17,6 +17,7 @@
     "autoprefixer": "^10.4.21",
     "feather-icons": "^4.29.2",
     "framer-motion": "^12.6.2",
+    "mp4box": "^0.5.4",
     "postcss": "^8.5.3",
     "react": "^19.1.0",
     "react-beautiful-dnd": "^13.1.1",
