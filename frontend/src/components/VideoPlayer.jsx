@@ -1,131 +1,163 @@
-import React, { useEffect, useRef, useState } from "react";
-
-const API_HOST = "http://localhost:8080"; // back‑end base URL
-
-/**
- * Live, un‑seekable player for GET /live/{channelNumber}
+/*  VideoPlayer.jsx  ─────────────────────────────────────────────────────
  *
- * Props
- * ────────────────────────────────────────────────────────────────
- * channelNumber   int        – which live channel to watch
- * muted           boolean    – start muted (needed for autoplay)
- * volume          0‥1        – initial volume
- */
-const VideoPlayer = ({ channelNumber, muted = true, volume = 1.0 }) => {
+ *  Requirements :
+ *    npm i mp4box
+ *  or (if you already added it)
+ *    import MP4Box from "mp4box/dist/mp4box.all.min.js";
+ *
+ *  This component:
+ *    • fetches  /live/{channelNumber}  (fragmented‑MP4)
+ *    • parses   incoming boxes with mp4box.js
+ *    • pushes   ready segments to Media Source Extensions
+ *    • shows    spinner / error overlays like the original
+ *    • keeps    the same Tailwind classes & channel label
+ * -------------------------------------------------------------------- */
+import React, { useEffect, useRef, useState } from "react";
+import MP4Box from "mp4box"; // ←  gpac/mp4box.js
+
+const API_HOST =
+  process.env.NODE_ENV === "production"
+    ? window.location.origin
+    : "http://localhost:8080";
+
+function VideoPlayer({ channelNumber, muted = true, volume = 1 }) {
   const videoRef = useRef(null);
-  const [isLoading, setIsLoading] = useState(true);
+
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  /* ─── create / switch stream ──────────────────────────────────────── */
+  /* ─── create / tear‑down whenever the channel changes ─────────────── */
   useEffect(() => {
-    if (channelNumber === undefined || channelNumber === null) return;
+    if (channelNumber == null) return;
 
     const video = videoRef.current;
     if (!video) return;
 
-    setIsLoading(true);
+    setLoading(true);
     setError(null);
 
+    /* 1. boot MediaSource */
     const mediaSource = new MediaSource();
-    let reader; // fetch reader for tidy cleanup
-    let firstChunk = true; // hide spinner after first append
+    const sourceBuffers = {}; // keyed by trackId
+    video.src = URL.createObjectURL(mediaSource);
 
-    /* fires once when MSE is ready                                      */
-    const handleSourceOpen = () => {
-      /* pick a codec string the current browser actually supports ------ */
-      const candidates = [
-        'video/mp4; codecs="avc1.640028,mp4a.40.2"', // H.264 High L4.0 + AAC
-        'video/mp4; codecs="avc1.4d401f,mp4a.40.2"', // Main L3.1
-        'video/mp4; codecs="avc1.42E01E,mp4a.40.2"', // Baseline L3.0
-        "video/mp4", // wildcard fallback
-      ];
-      const mime = candidates.find((c) => MediaSource.isTypeSupported(c));
-      if (!mime) {
-        setError("Browser lacks MP4 (H.264/AAC) support");
-        return;
-      }
+    /* 2. boot mp4box.js */
+    const mp4boxFile = MP4Box.createFile();
+    let nextFilePos = 0; // byte offset fed so far
+    let fetchReader; // cancelled on cleanup
 
-      const buf = mediaSource.addSourceBuffer(mime);
-      buf.addEventListener("error", (e) => {
-        console.error("SourceBuffer fatal error", e);
-        setError("Browser rejected the stream");
+    /* ── mp4box callbacks ──────────────────────────────────────────── */
+    mp4boxFile.onError = (e) => {
+      console.error("mp4box error", e);
+      setError("Stream parse error");
+    };
+
+    /** called once init segments are parsed */
+    mp4boxFile.onReady = (info) => {
+      /* For each track (video + audio) create one SourceBuffer */
+      info.tracks.forEach((trk) => {
+        const mime = `video/mp4; codecs="${trk.codec}"`;
+        if (!MediaSource.isTypeSupported(mime)) {
+          setError(`Browser cannot play ${trk.codec}`);
+          return;
+        }
+
+        const sb = mediaSource.addSourceBuffer(mime);
+        sb.mode = "segments";
+        sourceBuffers[trk.id] = { sb, queue: [] };
+
+        /* flush queued segments when SB finishes updating */
+        sb.addEventListener("updateend", () => flushQueue(trk.id));
       });
 
-      /* recursive read‑&‑append loop with updateend gating ------------- */
-      const pump = () =>
-        reader.read().then(({ value, done }) => {
-          if (done) {
-            const finish = () => mediaSource.endOfStream();
-            return buf.updating
-              ? buf.addEventListener("updateend", finish, { once: true })
-              : finish();
-          }
+      /* ask mp4box to generate segments forever */
+      info.tracks.forEach((trk) => {
+        mp4boxFile.setSegmentOptions(trk.id, null, { nbSegments: Infinity });
+      });
+      mp4boxFile.initializeSegmentation();
+    };
 
-          const push = () => {
-            if (!buf.updating) {
-              try {
-                buf.appendBuffer(value);
-                if (firstChunk) {
-                  setIsLoading(false);
-                  firstChunk = false;
-                }
-                pump(); // next chunk
-              } catch (e) {
-                console.error("appendBuffer failed:", e);
-                setError("Decode error");
-              }
-            } else {
-              buf.addEventListener("updateend", push, { once: true });
-            }
-          };
-          push();
-        });
+    /** called every time mp4box has a full fMP4 segment ready */
+    mp4boxFile.onSegment = (id, user, buffer) => {
+      const seg = new Uint8Array(buffer);
+      const buf = sourceBuffers[id];
+      if (!buf) return; // should not happen
+      buf.queue.push(seg);
+      flushQueue(id);
+      if (loading) setLoading(false);
+    };
 
-      /* start the network fetch --------------------------------------- */
+    /* helper: feed SourceBuffer if it's idle */
+    const flushQueue = (id) => {
+      const { sb, queue } = sourceBuffers[id];
+      if (!sb || sb.updating || !queue.length) return;
+      sb.appendBuffer(queue.shift());
+    };
+
+    /* ── once MediaSource opens, start the network fetch ───────────── */
+    const handleSourceOpen = () => {
       fetch(`${API_HOST}/live/${channelNumber}`)
         .then((res) => {
-          reader = res.body.getReader();
+          fetchReader = res.body.getReader();
+
+          /** recursive read‑loop */
+          const pump = () =>
+            fetchReader.read().then(({ value, done }) => {
+              if (done) {
+                mp4boxFile.flush();
+                return;
+              }
+              const ab = value.buffer.slice(
+                value.byteOffset,
+                value.byteOffset + value.byteLength
+              );
+              ab.fileStart = nextFilePos;
+              nextFilePos += ab.byteLength;
+              mp4boxFile.appendBuffer(ab); // hand chunk to mp4box
+              pump();
+            });
+
           pump();
         })
         .catch((e) => {
-          console.error("Stream fetch failed:", e);
-          setError("Stream error");
+          console.error("Fetch error", e);
+          setError("Network error");
         });
     };
 
-    /* attach BEFORE setting src to avoid missing the event              */
     mediaSource.addEventListener("sourceopen", handleSourceOpen);
-    video.src = URL.createObjectURL(mediaSource);
 
-    /* respect autoplay policies                                         */
+    /* final player tweaks */
     video.muted = muted;
     video.volume = volume;
     video.play().catch(() => {
-      /* user will need to click play; spinner stays until then */
+      /* wait for user gesture */
     });
 
-    /* cleanup on unmount / channel change ----------------------------- */
+    /* ─── cleanup ──────────────────────────────────────────────────── */
     return () => {
       mediaSource.removeEventListener("sourceopen", handleSourceOpen);
-      if (reader) reader.cancel();
+      fetchReader?.cancel();
+      mp4boxFile.flush();
       video.pause();
       video.removeAttribute("src");
       video.load();
     };
   }, [channelNumber]);
 
-  /* apply mute / volume updates on the fly ---------------------------- */
+  /* keep mute / volume reactive */
   useEffect(() => {
     const v = videoRef.current;
-    if (!v) return;
-    v.muted = muted;
-    v.volume = volume;
+    if (v) {
+      v.muted = muted;
+      v.volume = volume;
+    }
   }, [muted, volume]);
 
-  /* ─── UI markup (unchanged styling) ───────────────────────────────── */
+  /* ─── UI – exact same Tailwind look & feel ────────────────────────── */
   return (
     <div className="video-player-container relative w-full h-full">
-      {isLoading && (
+      {loading && !error && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-white z-10">
           Loading channel&nbsp;{channelNumber}…
         </div>
@@ -145,11 +177,11 @@ const VideoPlayer = ({ channelNumber, muted = true, volume = 1.0 }) => {
         controlsList="nodownload noremoteplayback nofullscreen noplaybackrate"
       />
 
-      <div className="absolute bottom-4 left-4 text-white bg-black/60 px-3 py-1 rounded">
+      <div className="absolute bottom-4 left-4 bg-black/60 text-white px-3 py-1 rounded">
         Live&nbsp;·&nbsp;Channel&nbsp;{channelNumber}
       </div>
     </div>
   );
-};
+}
 
 export default VideoPlayer;
