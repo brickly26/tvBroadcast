@@ -131,22 +131,36 @@ const useWebSocket = (path = "ws") => {
       }
 
       // Connect to the backend WebSocket server
-      // Make sure this points to your Go backend server, not the frontend dev server
-      const apiBaseUrl =
-        process.env.NODE_ENV === "production"
-          ? window.location.origin
-          : "http://localhost:8080";
+      let wsUrl;
 
-      const wsProtocol = apiBaseUrl.startsWith("https") ? "wss:" : "ws:";
-      const wsHost = apiBaseUrl.replace(/^https?:\/\//, "");
-      const wsUrl = `${wsProtocol}//${wsHost}/ws`;
+      if (process.env.NODE_ENV === "production") {
+        // In production, use relative URL which will use the same host as the page
+        const wsProtocol =
+          window.location.protocol === "https:" ? "wss:" : "ws:";
+        wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+      } else {
+        // In development, use Vite's proxy through the same origin
+        // This avoids CORS issues by having Vite proxy the request
+        const wsProtocol =
+          window.location.protocol === "https:" ? "wss:" : "ws:";
+        wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+      }
 
       console.log("Creating WebSocket connection to:", wsUrl);
       const socket = new WebSocket(wsUrl);
       socketRef.current = socket;
 
+      // Set a connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (socket.readyState !== WebSocket.OPEN) {
+          console.log("WebSocket connection timeout - forcing reconnect");
+          socket.close();
+        }
+      }, 10000);
+
       socket.onopen = () => {
-        console.log("WebSocket connected");
+        console.log("WebSocket connected successfully");
+        clearTimeout(connectionTimeout);
         setConnectionStatus("connected");
         reconnectAttemptsRef.current = 0;
 
@@ -259,11 +273,16 @@ const useWebSocket = (path = "ws") => {
       return socket;
     };
 
-    // Create the initial connection
-    establishConnection();
+    // Create the initial connection but with a small delay to avoid
+    // connection attempts during React's double-invoke effect pattern
+    const initTimer = setTimeout(() => {
+      establishConnection();
+    }, 100);
 
     // Cleanup function when component unmounts
     return () => {
+      clearTimeout(initTimer);
+
       if (socketRef.current) {
         console.log("Component unmounting, closing WebSocket connection");
         socketRef.current.close(1000, "Component unmounting");
