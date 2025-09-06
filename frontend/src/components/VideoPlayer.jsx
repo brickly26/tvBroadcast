@@ -2,6 +2,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import MP4Box from "mp4box";
 
+// Maximum amount of buffered media to keep (seconds)
+const MAX_BUFFER_SECONDS = 30;
+
 /**
  * Props
  * ───────────────────────────────────────────────────────────
@@ -118,14 +121,22 @@ export default function VideoPlayer({
         sb.addEventListener("updateend", () => {
           pump(t.id);
 
+          const buffered = sb.buffered;
+          if (
+            buffered.length &&
+            buffered.end(0) - buffered.start(0) > MAX_BUFFER_SECONDS
+          ) {
+            sb.remove(0, buffered.end(0) - MAX_BUFFER_SECONDS);
+          }
+
           /* seek to live edge once first video data buffered */
           if (
             !haveSeeked &&
             t.type === "video" &&
-            sb.buffered.length &&
-            sb.buffered.end(sb.buffered.length - 1) > 0
+            buffered.length &&
+            buffered.end(buffered.length - 1) > 0
           ) {
-            const edge = sb.buffered.end(sb.buffered.length - 1);
+            const edge = buffered.end(buffered.length - 1);
             videoRef.current.currentTime = edge - 0.3;
             videoRef.current
               .play()
